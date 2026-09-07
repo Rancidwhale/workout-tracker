@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class Exercise(UUIDPKMixin, TimestampMixin, Base):
     __tablename__= 'exercises'
     __table_args__=(
-        UniqueConstraint("name", "created_by", name="uq_exercise_name_created_by")
+        UniqueConstraint("name", "created_by", name="uq_exercise_name_created_by"),
     )
 
     name: Mapped[str] = mapped_column(String(150), nullable=False)

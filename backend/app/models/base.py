@@ -17,7 +17,7 @@ class UUIDPKMixin:
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
-        server_default=func.get_random_uuid(),
+        server_default=func.gen_random_uuid(),
     )
 
 class TimestampMixin:
@@ -32,6 +32,6 @@ class TimestampMixin:
     modified_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
-        server_defaut=func.now(),
+        server_default=func.now(),
         onupdate=func.now(),
     )
