@@ -3,20 +3,20 @@ Auth routes — .
 
 POST /auth/signup   - create account
 POST /auth/login    - issue access + refresh token pair
-POST /auth/refresh  - exchange a valid refresh token for a new access token
+POST /auth/refresh  - rotate a refresh token: revoke it, issue a new token pair
+GET  /auth/me       - current user (requires Bearer access token)
 """
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
 from app.schemas.auth import (
-    AccessTokenResponse,
     LoginRequest,
     RefreshRequest,
     SignupRequest,
@@ -25,7 +25,6 @@ from app.schemas.auth import (
 )
 from app.utils.security import (
     create_access_token,
-    decode_access_token,
     generate_refresh_token,
     hash_password,
     hash_refresh_token,
@@ -34,10 +33,6 @@ from app.utils.security import (
 )
 
 router = APIRouter()
-
-# tokenUrl is just for the OpenAPI docs "Authorize" button; the actual login
-# endpoint takes JSON, not form-encoded credentials.
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
 @router.post("/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -87,46 +82,65 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/refresh", response_model=AccessTokenResponse)
+@router.post("/refresh", response_model=TokenResponse)
 def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
+    """
+    Rotate a refresh token: the presented token is revoked and a brand-new
+    access + refresh pair is issued. Each refresh token is single-use.
+
+    If an already-revoked token is presented, we treat it as a sign the token
+    was stolen (reuse detection) and revoke every active token for that user,
+    forcing a fresh login.
+    """
+    invalid_token_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
+    )
+
     token_hash = hash_refresh_token(payload.refresh_token)
+    # Row lock so two concurrent refreshes with the same token can't both win.
     stored = (
         db.query(RefreshToken)
         .filter(RefreshToken.token_hash == token_hash)
+        .with_for_update()
         .first()
     )
 
-    if not stored or stored.revoked:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
-        )
+    if not stored:
+        raise invalid_token_exception
+
+    if stored.revoked:
+        db.query(RefreshToken).filter(
+            RefreshToken.user_id == stored.user_id,
+            RefreshToken.revoked.is_(False),
+        ).update({RefreshToken.revoked: True}, synchronize_session=False)
+        db.commit()
+        raise invalid_token_exception
+
     if stored.expires_at < datetime.now(timezone.utc):
+        stored.revoked = True
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired"
         )
 
-    access_token = create_access_token(stored.user_id)
-    return AccessTokenResponse(
-        access_token=access_token,
+    stored.revoked = True
+    plaintext_refresh_token = generate_refresh_token()
+    db.add(
+        RefreshToken(
+            user_id=stored.user_id,
+            token_hash=hash_refresh_token(plaintext_refresh_token),
+            expires_at=refresh_token_expiry(),
+        )
+    )
+    db.commit()
+
+    return TokenResponse(
+        access_token=create_access_token(stored.user_id),
+        refresh_token=plaintext_refresh_token,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
 
-# --- Shared dependency for protecting other routers (workouts, progress, etc.) ---
-
-def get_current_user(
-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
-) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    user_id = decode_access_token(token)
-    if user_id is None:
-        raise credentials_exception
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise credentials_exception
-    return user
+@router.get("/me", response_model=UserOut)
+def me(current_user: User = Depends(get_current_user)):
+    return current_user
