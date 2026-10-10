@@ -4,7 +4,7 @@ Exercise model — LLD Section 1: `exercises` table (exercise library).
 import uuid
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import UniqueConstraint, String, Boolean, ForeignKey
+from sqlalchemy import Index, UniqueConstraint, String, Boolean, ForeignKey, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -18,6 +18,14 @@ class Exercise(UUIDPKMixin, TimestampMixin, Base):
     __tablename__= 'exercises'
     __table_args__=(
         UniqueConstraint("name", "created_by", name="uq_exercise_name_created_by"),
+        # One built-in exercise per name, case-insensitive (NULL created_by
+        # rows never conflict under the constraint above).
+        Index(
+            "uq_exercises_builtin_name",
+            text("lower(name)"),
+            unique=True,
+            postgresql_where=text("created_by IS NULL"),
+        ),
     )
 
     name: Mapped[str] = mapped_column(String(150), nullable=False)
